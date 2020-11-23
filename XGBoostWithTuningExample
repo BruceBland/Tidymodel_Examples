@@ -1,0 +1,187 @@
+# Tidymodels XGBoost example
+# Taken from https://www.r-bloggers.com/2020/05/using-xgboost-with-tidymodels/
+
+# data
+library(AmesHousing)
+
+# data cleaning
+library(janitor)
+
+# data prep
+library(dplyr)
+
+# tidymodels
+library(rsample)
+library(recipes)
+library(parsnip)
+library(tune)
+library(dials)
+library(workflows)
+library(yardstick)
+
+# speed up computation with parrallel processing (optional)
+library(doParallel)
+all_cores <- parallel::detectCores(logical = FALSE)
+registerDoParallel(cores = all_cores)
+
+# set the random seed so we can reproduce any simulated results.
+set.seed(1234)
+
+# load the housing data and clean names
+ames_data <- make_ames() %>%
+  janitor::clean_names()
+
+# split into training and testing datasets. Stratify by Sale price 
+# Note: Use methods training(splitname) to get the training data out or testing(splitname) to get the testing set
+ames_split <- rsample::initial_split(
+  ames_data,               # Data set to use
+  prop = 0.2,              # The training set will only use a very small 25% of the data
+  strata = sale_price      # The strata ensures that data in the training set does not just have a single value for this column
+)
+
+# preprocessing "recipe"
+# In tidymodels, we use the recipes package to define these preprocessing steps, in what is called a “recipe”
+preprocessing_recipe <- 
+  recipes::recipe(sale_price ~ ., data = training(ames_split)) %>%    # Basic model
+  
+  # convert categorical variables to factors
+  recipes::step_string2factor(all_nominal()) %>%
+  
+  # combine low frequency factor levels
+  recipes::step_other(all_nominal(), threshold = 0.01) %>%
+  
+  # remove no variance predictors which provide no predictive information 
+  recipes::step_nzv(all_nominal()) %>%
+  prep()
+
+# We apply our previously defined preprocessing recipe with bake(). Then we use cross-validation to randomly
+# split the training data into further training and test sets. 
+# We will use these additional cross validation folds to tune our hyperparameters in a later step
+ames_cv_folds <- 
+  recipes::bake(
+    preprocessing_recipe, 
+    new_data = training(ames_split)
+  ) %>%  
+  rsample::vfold_cv(v = 3)
+
+# XGBoost model specification
+# We use the parsnip package to define the XGBoost model specification. 
+# Below we use boost_tree() along with tune() to define the 
+# hyperparameters to undergo tuning in a subsequent step
+xgboost_model <- 
+  parsnip::boost_tree(
+    mode = "regression",
+    trees = tune(),        # All all the following to be selected randomly when training
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune()
+  ) %>%
+  set_engine("xgboost", objective = "reg:squarederror")
+
+# grid specification
+xgboost_params <- 
+  dials::parameters(
+    trees(),
+    min_n(),
+    tree_depth(),
+    learn_rate(),
+    loss_reduction()
+  )
+
+#Define the grid of parameters to check
+xgboost_grid <- 
+  dials::grid_max_entropy(
+    xgboost_params, 
+    size = 20                   # Size of the grid (Note Grid size * cv fold = number of times to run the model)
+  )
+print(head(xgboost_grid,20))
+
+# Define workflow
+xgboost_wf <- 
+  workflows::workflow() %>%
+  add_model(xgboost_model) %>% 
+  add_formula(sale_price ~ .)
+
+# hyperparameter tuning
+xgboost_tuned <- tune::tune_grid(
+  object = xgboost_wf,
+  resamples = ames_cv_folds,
+  grid = xgboost_grid,
+  metrics = yardstick::metric_set(rmse, rsq, mae),
+  control = tune::control_grid(verbose = TRUE)
+)
+
+# Now lets tune the model using the above grid - Will take some time
+xgboost_tuned %>%
+  tune::show_best(metric = "rmse") %>%
+  print()
+
+# Find the best rmse
+xgboost_best_params <- xgboost_tuned %>%
+  tune::select_best("rmse")
+print(xgboost_best_params)
+
+# Now create the best model using the above params
+xgboost_model_final <- xgboost_model %>% 
+  finalize_model(xgboost_best_params)
+
+# MOw run the training data through the model
+train_processed <- bake(preprocessing_recipe,  new_data = training(ames_split))
+train_prediction <- xgboost_model_final %>%
+  # fit the model on all the training data
+  fit(
+    formula = sale_price ~ ., 
+    data    = train_processed
+  ) %>%
+  # predict the sale prices for the training data
+  predict(new_data = train_processed) %>%
+  bind_cols(training(ames_split))
+xgboost_score_train <- 
+  train_prediction %>%
+  yardstick::metrics(sale_price, .pred) %>%
+  mutate(.estimate = format(round(.estimate, 2), big.mark = ","))
+print(xgboost_score_train)
+             
+# NOw run the test data through
+test_processed  <- bake(preprocessing_recipe, new_data = testing(ames_split))
+test_prediction <- xgboost_model_final %>%
+ # fit the model on all the training data
+ fit(
+   formula = sale_price ~ ., 
+   data    = train_processed
+ ) %>%
+ # use the training model fit to predict the test data
+ predict(new_data = test_processed) %>%
+ bind_cols(testing(ames_split))
+
+# measure the accuracy of our model using `yardstick`
+xgboost_score <- 
+ test_prediction %>%
+ yardstick::metrics(sale_price, .pred) %>%
+ mutate(.estimate = format(round(.estimate, 2), big.mark = ","))
+print(xgboost_score)
+
+# Get the residulas and plot them to check unusual errors in predictions
+house_prediction_residual <- test_prediction %>%
+  arrange(.pred) %>%
+  mutate(residual_pct = (sale_price - .pred) / .pred) %>%
+  select(.pred, residual_pct, sale_price)
+
+Plot <- ggplot(house_prediction_residual, aes(x = sale_price , y = .pred )) +
+  geom_point() +
+  xlab("Sale Price") +
+  ylab("Actual Sale Price") +
+  scale_x_continuous(labels = scales::dollar_format()) +
+  scale_y_continuous(labels = scales::percent)
+print(Plot)
+
+Plot <- ggplot(house_prediction_residual, aes(x = .pred, y = residual_pct)) +
+  geom_point() +
+  xlab("Predicted Sale Price") +
+  ylab("Residual (%)") +
+  scale_x_continuous(labels = scales::dollar_format()) +
+  scale_y_continuous(labels = scales::percent)
+print(Plot)
+
+# end
