@@ -1,0 +1,69 @@
+# Library
+library(tidymodels)
+
+# Data from model data
+data(bivariate)
+
+#A plot of the data shows two right-skewed predictors:
+print(ggplot(bivariate_train, aes(x = A, y = B, col = Class)) + 
+  geom_point(alpha = .2))
+  
+#Recipe for data
+# We will juice() to get the processed training set back
+biv_rec <- 
+  recipe(Class ~ ., data = bivariate_train) %>%
+  step_BoxCox(all_predictors())%>%
+  step_normalize(all_predictors()) %>%
+  prep(training = bivariate_train, retain = TRUE)
+
+# For validation:
+val_normalized <- bake(biv_rec, new_data = bivariate_val, all_predictors())
+# For testing when we arrive at a final model: 
+test_normalized <- bake(biv_rec, new_data = bivariate_test, all_predictors())
+
+set.seed(57974)
+# We can use the keras package to fit a model 
+# with 5 hidden units and a 10% dropout rate, to regularize the model:
+nnet_fit <-
+  mlp(epochs = 50, hidden_units = 5, dropout = 0.1) %>%
+  set_mode("classification") %>% 
+  # Also set engine-specific `verbose` argument to prevent logging the results: Although warnings still
+  # get printed the first run through
+  set_engine("keras", verbose = 0) %>%
+  fit(Class ~ ., data = juice(biv_rec))
+
+print(nnet_fit)
+
+# In parsnip, the predict() function can be used to characterize performance on the validation set. 
+# Since parsnip always produces tibble outputs, these can just be column bound to the original data:
+val_results <- 
+  bivariate_val %>%
+  bind_cols(
+    predict(nnet_fit, new_data = val_normalized),
+    predict(nnet_fit, new_data = val_normalized, type = "prob")
+  )
+
+#Now analyse the results
+print(val_results %>% roc_auc(truth = Class, .pred_One))
+print(val_results %>% accuracy(truth = Class, .pred_class))
+print(val_results %>% conf_mat(truth = Class, .pred_class))
+
+#################
+# plot
+
+a_rng <- range(bivariate_train$A)
+b_rng <- range(bivariate_train$B)
+x_grid <-
+  expand.grid(A = seq(a_rng[1], a_rng[2], length.out = 100),
+              B = seq(b_rng[1], b_rng[2], length.out = 100))
+x_grid_trans <- bake(biv_rec, x_grid)
+
+# Make predictions using the transformed predictors but 
+# attach them to the predictors in the original units: 
+x_grid <- 
+  x_grid %>% 
+  bind_cols(predict(nnet_fit, x_grid_trans, type = "prob"))
+
+print(ggplot(x_grid, aes(x = A, y = B)) + 
+  geom_contour(aes(z = .pred_One), breaks = .5, col = "black") + 
+  geom_point(data = bivariate_val, aes(col = Class), alpha = 0.3))
